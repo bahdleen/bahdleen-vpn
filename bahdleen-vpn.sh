@@ -14,7 +14,9 @@ set -Eeuo pipefail
 # ============================================================
 
 SCRIPT_NAME="bahdleen-vpn"
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="1.1.0"
+SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_SELF_DIR="$(dirname "${SCRIPT_SELF}")"
 
 # ----------------------------
 # Server paths
@@ -75,16 +77,33 @@ WG_SERVER_IP="10.20.0.1/24"
 # UI Helpers
 # ============================================================
 
+if [[ -t 1 ]]; then
+    C_RESET='\033[0m'; C_BOLD='\033[1m'
+    C_RED='\033[31m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_CYAN='\033[36m'
+else
+    C_RESET=''; C_BOLD=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''
+fi
+
 clr() { printf '\033c'; }
-info() { printf "[INFO] %s\n" "$*"; }
-ok()   { printf "[ OK ] %s\n" "$*"; }
-warn() { printf "[WARN] %s\n" "$*"; }
-err()  { printf "[ERR ] %s\n" "$*" >&2; }
+info() { printf "${C_CYAN}[INFO]${C_RESET} %s\n" "$*"; }
+ok()   { printf "${C_GREEN}[ OK ]${C_RESET} %s\n" "$*"; }
+warn() { printf "${C_YELLOW}[WARN]${C_RESET} %s\n" "$*"; }
+err()  { printf "${C_RED}[ERR ]${C_RESET} %s\n" "$*" >&2; }
 
 pause() {
     printf "Press Enter to continue..."
     read -r _
 }
+
+# Friendly message instead of a raw bash stack trace on unexpected failures.
+# (Deliberate `need_root || return 1` / `[[ ... ]] || return 1` guards don't
+# reach this trap since their non-zero status is already consumed by && / ||.)
+on_error() {
+    local line="$1" code="$2"
+    err "Unexpected error on line ${line} (exit code ${code})."
+    err "Re-run with: bash -x ${SCRIPT_SELF} to see exactly what failed."
+}
+trap 'on_error "${LINENO}" "$?"' ERR
 
 ascii_banner() {
 cat <<'EOF'
@@ -405,12 +424,26 @@ apply_nat_rules_both() {
     iptables -t nat -C POSTROUTING -s "10.20.0.0/24" -o "${iface}" -j MASQUERADE 2>/dev/null \
         || iptables -t nat -A POSTROUTING -s "10.20.0.0/24" -o "${iface}" -j MASQUERADE
 
+    # MASQUERADE alone only rewrites addresses; it does not grant permission to
+    # forward the traffic. Distros/tools (notably Docker, which sets the
+    # FORWARD chain's default policy to DROP) can leave VPN clients connected
+    # but unable to reach the internet unless we explicitly allow forwarding
+    # for the tunnel interfaces.
+    iptables -C FORWARD -i tun+ -j ACCEPT 2>/dev/null \
+        || iptables -I FORWARD -i tun+ -j ACCEPT
+    iptables -C FORWARD -o tun+ -j ACCEPT 2>/dev/null \
+        || iptables -I FORWARD -o tun+ -j ACCEPT
+    iptables -C FORWARD -i "${WG_IF}" -j ACCEPT 2>/dev/null \
+        || iptables -I FORWARD -i "${WG_IF}" -j ACCEPT
+    iptables -C FORWARD -o "${WG_IF}" -j ACCEPT 2>/dev/null \
+        || iptables -I FORWARD -o "${WG_IF}" -j ACCEPT
+
     if [[ "${PKG_MGR}" == "apt" ]]; then
         netfilter-persistent save >/dev/null 2>&1 || true
         netfilter-persistent reload >/dev/null 2>&1 || true
     fi
 
-    ok "NAT configured and persistent."
+    ok "NAT and forwarding rules configured and persistent."
 }
 
 # ============================================================
@@ -883,7 +916,8 @@ add_wireguard_peer() {
     allowed_ip="$(next_wg_ip)"
 
     {
-        printf "\n[Peer]\n"
+        printf "\n# peer_name: %s\n" "${peer}"
+        printf "[Peer]\n"
         printf "PublicKey = %s\n" "${peer_pub}"
         printf "AllowedIPs = %s\n" "${allowed_ip}"
     } >> "${WG_CONF}"
@@ -910,7 +944,14 @@ EOF
     chown "${RUN_USER}:${RUN_USER}" "${client_conf}" 2>/dev/null || true
     chmod 600 "${client_conf}" 2>/dev/null || true
 
-    systemctl restart "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+    # Apply the new peer live instead of restarting the whole interface, so
+    # existing connected peers aren't disconnected just to add one more.
+    if systemctl is-active --quiet "wg-quick@${WG_IF}"; then
+        wg set "${WG_IF}" peer "${peer_pub}" allowed-ips "${allowed_ip}" \
+            || systemctl restart "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+    else
+        systemctl restart "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+    fi
 
     ok "WireGuard peer exported:"
     printf "  %s\n" "${client_conf}"
@@ -930,16 +971,43 @@ remove_wireguard_peer() {
     [[ ! -f "${WG_CONF}" ]] && { err "WireGuard config not found."; pause; return 1; }
 
     local peer
-    read -r -p "Enter peer export folder name to remove: " peer
+    read -r -p "Enter peer name to remove: " peer
     [[ -z "${peer}" ]] && { err "Peer name cannot be empty."; pause; return 1; }
 
-    warn "For safety, remove the matching [Peer] block manually in:"
-    warn "  ${WG_CONF}"
+    if ! grep -qF "# peer_name: ${peer}" "${WG_CONF}"; then
+        err "No peer named '${peer}' found in ${WG_CONF}."
+        warn "Peers added before this script's update won't have a name tag;"
+        warn "remove their [Peer] block manually if needed."
+        pause
+        return 1
+    fi
+
+    local peer_pub
+    peer_pub="$(awk -v tag="# peer_name: ${peer}" '
+        $0 == tag { found=1; next }
+        found && /^PublicKey = / { print $3; exit }
+    ' "${WG_CONF}")"
+
+    # Drop the "# peer_name: X" comment, the following [Peer] header, and every
+    # line until the next blank line or [Peer]/[Interface] section.
+    awk -v tag="# peer_name: ${peer}" '
+        $0 == tag { skipping=1; next }
+        skipping && /^\[Peer\]/ { next }
+        skipping && (/^\s*$/ || /^\[/) { skipping=0 }
+        !skipping { print }
+    ' "${WG_CONF}" > "${WG_CONF}.tmp" && mv "${WG_CONF}.tmp" "${WG_CONF}"
+    chmod 600 "${WG_CONF}" 2>/dev/null || true
+
+    if [[ -n "${peer_pub}" ]] && systemctl is-active --quiet "wg-quick@${WG_IF}"; then
+        wg set "${WG_IF}" peer "${peer_pub}" remove \
+            || systemctl restart "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+    else
+        systemctl restart "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+    fi
 
     rm -rf "${WG_EXPORT_BASE:?}/${peer}" || true
-    systemctl restart "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
 
-    ok "Peer export removed: ${peer}"
+    ok "Peer removed and revoked: ${peer}"
     pause
 }
 
@@ -1006,9 +1074,22 @@ show_status() {
     printf "  OpenVPN:   %s\n" "${OVPN_EXPORT_BASE}"
     printf "  WireGuard: %s\n\n" "${WG_EXPORT_BASE}"
 
+    local ovpn_connected=0 wg_peers=0
+    [[ -f /run/openvpn-server/status-server.log ]] \
+        && ovpn_connected="$(grep -c '^CLIENT_LIST,' /run/openvpn-server/status-server.log 2>/dev/null || echo 0)"
+    wg_peers="$(wg show "${WG_IF}" peers 2>/dev/null | wc -l || echo 0)"
+
     printf "Services:\n"
-    systemctl is-active --quiet openvpn-server@server && printf "  OpenVPN:   active\n" || printf "  OpenVPN:   inactive\n"
-    systemctl is-active --quiet "wg-quick@${WG_IF}" && printf "  WireGuard: active\n" || printf "  WireGuard: inactive\n"
+    if systemctl is-active --quiet openvpn-server@server; then
+        printf "  OpenVPN:   ${C_GREEN}active${C_RESET}   (%s connected)\n" "${ovpn_connected}"
+    else
+        printf "  OpenVPN:   ${C_YELLOW}inactive${C_RESET}\n"
+    fi
+    if systemctl is-active --quiet "wg-quick@${WG_IF}"; then
+        printf "  WireGuard: ${C_GREEN}active${C_RESET}   (%s peers configured)\n" "${wg_peers}"
+    else
+        printf "  WireGuard: ${C_YELLOW}inactive${C_RESET}\n"
+    fi
 
     printf "\nEndpoint: %s\n" "$(get_saved_endpoint 2>/dev/null || echo "none")"
     printf "DNS:      %s\n" "$(get_saved_dns)"
@@ -1081,7 +1162,7 @@ install_global_command() {
     local BIN_PATH="/usr/local/bin/${SCRIPT_NAME}"
 
     mkdir -p "${LIB_DIR}"
-    install -m 755 "${PWD}/${SCRIPT_NAME}.sh" "${LIB_DIR}/${SCRIPT_NAME}.sh"
+    install -m 755 "${SCRIPT_SELF}" "${LIB_DIR}/${SCRIPT_NAME}.sh"
 
     cat > "${BIN_PATH}" <<EOF
 #!/usr/bin/env bash
@@ -1158,22 +1239,26 @@ main_loop() {
         local opt
         read -r -p "Select option: " opt
 
+        # Every action is run with `|| true`: under `set -e`, a plain non-zero
+        # return here (e.g. need_root failing when not launched via the
+        # installed sudo wrapper) would otherwise silently kill the whole
+        # script instead of returning to the menu.
         case "${opt}" in
-            1) install_global_command ;;
-            2) setup_openvpn ;;
-            3) setup_wireguard ;;
-            4) setup_both ;;
-            5) add_openvpn_client ;;
-            6) revoke_openvpn_client ;;
-            7) add_wireguard_peer ;;
-            8) remove_wireguard_peer ;;
-            9) show_status ;;
-            10) update_libraries ;;
-            11) repair_dirs ;;
-            12) cleanup_leftovers ;;
-            13) reset_reinstall_both ;;
-            14) uninstall_everything ;;
-            15) show_help ;;
+            1) install_global_command || true ;;
+            2) setup_openvpn || true ;;
+            3) setup_wireguard || true ;;
+            4) setup_both || true ;;
+            5) add_openvpn_client || true ;;
+            6) revoke_openvpn_client || true ;;
+            7) add_wireguard_peer || true ;;
+            8) remove_wireguard_peer || true ;;
+            9) show_status || true ;;
+            10) update_libraries || true ;;
+            11) repair_dirs || true ;;
+            12) cleanup_leftovers || true ;;
+            13) reset_reinstall_both || true ;;
+            14) uninstall_everything || true ;;
+            15) show_help || true ;;
             0) exit 0 ;;
             *) warn "Invalid option."; pause ;;
         esac
