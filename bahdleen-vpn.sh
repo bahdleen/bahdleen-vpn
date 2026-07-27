@@ -14,7 +14,7 @@ set -Eeuo pipefail
 # ============================================================
 
 SCRIPT_NAME="bahdleen-vpn"
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_SELF_DIR="$(dirname "${SCRIPT_SELF}")"
 
@@ -35,7 +35,7 @@ WG_CONF="${WG_DIR}/${WG_IF}.conf"
 # ----------------------------
 # User context
 # ----------------------------
-RUN_USER="${SUDO_USER:-${USER}}"
+RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 
 get_user_home() {
     local u="$1"
@@ -401,8 +401,20 @@ enable_ip_forwarding() {
     ok "IP forwarding enabled."
 }
 
+# firewalld (default on stock Fedora/RHEL/CentOS) manages its own nftables
+# state and can silently reset or conflict with raw iptables rules over
+# time. When it's already active we defer to it entirely via firewall-cmd
+# rather than installing/enabling a competing iptables.service alongside it.
+firewalld_active() {
+    command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null
+}
+
 ensure_nat_tools() {
     need_root || return 1
+    if firewalld_active; then
+        ok "firewalld is active — will configure via firewall-cmd, skipping raw iptables tools."
+        return 0
+    fi
     case "${PKG_MGR}" in
         apt) pkg_install iptables-persistent netfilter-persistent ;;
         dnf) pkg_install iptables iptables-services ;;
@@ -410,6 +422,29 @@ ensure_nat_tools() {
         zypper) pkg_install iptables ;;
         *) true ;;
     esac
+}
+
+# Standard firewalld pattern for a VPN server: put the tunnel interfaces in
+# the "trusted" zone (firewalld already permits all traffic, including
+# forwarding, for interfaces in that zone) and enable masquerade on whichever
+# zone owns the internet-facing interface. --permanent rules are firewalld's
+# own persistence mechanism, so no extra persistence step is needed here.
+apply_firewalld_rules() {
+    need_root || return 1
+    local iface="$1"
+
+    info "firewalld detected — configuring via firewall-cmd instead of raw iptables..."
+
+    local ext_zone
+    ext_zone="$(firewall-cmd --get-zone-of-interface="${iface}" 2>/dev/null || true)"
+    [[ -z "${ext_zone}" ]] && ext_zone="$(firewall-cmd --get-default-zone 2>/dev/null || echo public)"
+
+    firewall-cmd --permanent --zone=trusted --add-interface=tun0 >/dev/null 2>&1 || true
+    firewall-cmd --permanent --zone=trusted --add-interface="${WG_IF}" >/dev/null 2>&1 || true
+    firewall-cmd --permanent --zone="${ext_zone}" --add-masquerade >/dev/null 2>&1 || true
+
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    ok "firewalld rules applied (trusted zone: tun0/${WG_IF}, masquerade zone: ${ext_zone})."
 }
 
 # Persist current iptables rules across reboot. Every branch below installs
@@ -464,6 +499,11 @@ UNIT
 apply_nat_rules_both() {
     need_root || return 1
     local iface="$1"
+
+    if firewalld_active; then
+        apply_firewalld_rules "${iface}"
+        return 0
+    fi
 
     info "Applying NAT rules for OpenVPN + WireGuard..."
 
@@ -1139,6 +1179,11 @@ show_status() {
 
     printf "\nEndpoint: %s\n" "$(get_saved_endpoint 2>/dev/null || echo "none")"
     printf "DNS:      %s\n" "$(get_saved_dns)"
+    if firewalld_active; then
+        printf "Firewall: firewalld (via firewall-cmd)\n"
+    else
+        printf "Firewall: raw iptables\n"
+    fi
     printf "Version:  %s\n" "${SCRIPT_VERSION}"
 
     pause
