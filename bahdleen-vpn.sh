@@ -412,6 +412,55 @@ ensure_nat_tools() {
     esac
 }
 
+# Persist current iptables rules across reboot. Every branch below installs
+# a persistence tool in ensure_nat_tools() but previously only the apt branch
+# ever actually called it — on Fedora/Arch/openSUSE the FORWARD/MASQUERADE
+# rules silently vanished on the next reboot with no error at setup time.
+persist_iptables_rules() {
+    need_root || return 1
+    case "${PKG_MGR}" in
+        apt)
+            netfilter-persistent save >/dev/null 2>&1 || true
+            netfilter-persistent reload >/dev/null 2>&1 || true
+            ;;
+        dnf)
+            if command -v iptables-save >/dev/null 2>&1; then
+                mkdir -p /etc/sysconfig
+                iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+                systemctl enable --now iptables >/dev/null 2>&1 || true
+            fi
+            ;;
+        pacman|zypper|*)
+            # No universal native persistence tool on these distros. Fall
+            # back to a small oneshot unit that restores a saved ruleset
+            # before networking comes up, so this works the same way
+            # regardless of distro.
+            if command -v iptables-save >/dev/null 2>&1 && command -v iptables-restore >/dev/null 2>&1; then
+                local restore_bin
+                restore_bin="$(command -v iptables-restore)"
+                mkdir -p /etc/bahdleen-vpn
+                iptables-save > /etc/bahdleen-vpn/iptables.rules 2>/dev/null || true
+                cat > /etc/systemd/system/bahdleen-vpn-iptables.service <<UNIT
+[Unit]
+Description=Restore Bahdleen VPN iptables rules
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=${restore_bin} /etc/bahdleen-vpn/iptables.rules
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+                systemctl daemon-reload >/dev/null 2>&1 || true
+                systemctl enable --now bahdleen-vpn-iptables.service >/dev/null 2>&1 || true
+            fi
+            ;;
+    esac
+}
+
 apply_nat_rules_both() {
     need_root || return 1
     local iface="$1"
@@ -438,10 +487,7 @@ apply_nat_rules_both() {
     iptables -C FORWARD -o "${WG_IF}" -j ACCEPT 2>/dev/null \
         || iptables -I FORWARD -o "${WG_IF}" -j ACCEPT
 
-    if [[ "${PKG_MGR}" == "apt" ]]; then
-        netfilter-persistent save >/dev/null 2>&1 || true
-        netfilter-persistent reload >/dev/null 2>&1 || true
-    fi
+    persist_iptables_rules
 
     ok "NAT and forwarding rules configured and persistent."
 }
